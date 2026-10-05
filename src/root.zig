@@ -2,6 +2,8 @@ pub const Server = @import("./server/Server.zig").Server;
 pub const ServerOptions = @import("./server/Server.zig").ServerOptions;
 pub const MAX_MTU_SIZE = @import("./server/Server.zig").MAX_MTU_SIZE;
 pub const Connection = @import("./server/Connection.zig").Connection;
+pub const SharedPayload = @import("./proto/Frame.zig").SharedPayload;
+pub const OutputSlab = @import("./server/OutputSlab.zig").OutputSlab;
 
 pub const Socket = @import("./socket/socket.zig").Socket;
 pub const Poller = @import("./socket/socket.zig").Poller;
@@ -17,6 +19,7 @@ pub const Client = @import("./client/client.zig").Client;
 pub const ClientOptions = @import("./client/client.zig").ClientOptions;
 
 pub const Priority = @import("./client/client.zig").Priority;
+pub const ServerPriority = @import("./server/Connection.zig").Priority;
 pub const Reliability = @import("./proto/Frame.zig").Reliability;
 
 test "all" {
