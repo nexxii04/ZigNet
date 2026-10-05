@@ -7,6 +7,29 @@ const Frame = Proto.Frame;
 const Reliability = Proto.Reliability;
 const ServerModule = @import("./Server.zig");
 const Server = ServerModule.Server;
+const SharedPayload = Proto.SharedPayload;
+const OutputSlab = @import("./OutputSlab.zig").OutputSlab;
+
+/// Local helper mirroring the game framing's unsigned LEB128 sizes.
+fn varintSize(value: usize) usize {
+    if (value < 0x80) return 1;
+    if (value < 0x4000) return 2;
+    if (value < 0x200000) return 3;
+    if (value < 0x10000000) return 4;
+    return 5;
+}
+
+fn writeVarInt(buffer: []u8, value: usize) usize {
+    var val = value;
+    var pos: usize = 0;
+    while (val >= 0x80) {
+        buffer[pos] = @intCast((val & 0x7F) | 0x80);
+        val >>= 7;
+        pos += 1;
+    }
+    buffer[pos] = @intCast(val & 0x7F);
+    return pos + 1;
+}
 
 const MAX_CHANNELS = 32;
 const MAX_ORDERING_QUEUE_SIZE = 64;
@@ -18,6 +41,11 @@ const MAX_PENDING_SEQUENCES = 8192;
 const RETRANSMIT_TIMEOUT_NS: i64 = 200 * std.time.ns_per_ms;
 const MAX_RETRANSMITS: u8 = 10;
 const MAX_RETRANSMITS_PER_TICK: usize = 32;
+// Thread-local scratch for the socket thread; oversized framesets fall back to the heap.
+const FRAMESET_SCRATCH_FRAMES: usize = 512;
+const ACK_SCRATCH_SEQUENCES: usize = Proto.MAX_SEQUENCES_PER_ACK;
+threadlocal var frameset_scratch: [FRAMESET_SCRATCH_FRAMES]Frame = undefined;
+threadlocal var ack_scratch: [ACK_SCRATCH_SEQUENCES]u32 = undefined;
 // 3 + 384*4 = 1539: worst-case ACK datagram; a bigger batch would fail to
 // serialize every tick and never ack.
 const MAX_ACK_BATCH: usize = 384;
@@ -37,9 +65,10 @@ const DEBUG = false;
 pub const GamePacketCallback = *const fn (connection: *Connection, payload: []const u8, context: ?*anyopaque) void;
 
 pub const BackupEntry = struct {
-    bytes: []u8,
+    bytes: []const u8,
     sent_ns: i64,
     retries: u8,
+    slot: ?u32 = null,
 };
 
 const ChannelQueue = std.AutoHashMap(u32, Frame);
@@ -51,6 +80,21 @@ fn initMapCapacity(comptime K: type, comptime V: type, allocator: std.mem.Alloca
     return map;
 }
 
+/// Moves up to `out.len` keys out of a pending-sequence set (caller holds the
+/// shard lock). One batch is serialized per tick and the batch cap fits the
+/// datagram scratch at comptime, so removing here cannot lose a sequence.
+fn collectSequences(set: *std.AutoHashMap(u24, void), out: []u32) usize {
+    var len: usize = 0;
+    var iter = set.keyIterator();
+    while (iter.next()) |key| {
+        if (len == out.len) break;
+        out[len] = key.*;
+        len += 1;
+    }
+    for (out[0..len]) |sequence| _ = set.remove(@truncate(sequence));
+    return len;
+}
+
 pub const Connection = struct {
     const Self = @This();
     server: *Server,
@@ -58,10 +102,10 @@ pub const Connection = struct {
     key: i64,
     mtu_size: u16,
     guid: i64,
-    connected: bool,
-    active: bool,
+    connected: std.atomic.Value(bool),
+    active: std.atomic.Value(bool),
     comm_data: CommData,
-    last_receive: Timestamp,
+    last_receive_ns: std.atomic.Value(u64),
     created_at: Timestamp,
     game_packet_callback: ?GamePacketCallback = null,
     game_packet_context: ?*anyopaque = null,
@@ -70,7 +114,6 @@ pub const Connection = struct {
     ping_interval: std.Io.Duration = .fromMilliseconds(5000),
     send_mutex: std.Io.Mutex = .init,
     pending_connect_event: bool = false,
-    send_scratch: [DATAGRAM_SCRATCH_SIZE]u8 = undefined,
     pending_movement: ?[]u8 = null,
 
     pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) Self {
@@ -80,8 +123,8 @@ pub const Connection = struct {
             .key = Server.addressToKey(address),
             .mtu_size = mtu_size,
             .guid = guid,
-            .connected = false,
-            .active = true,
+            .connected = std.atomic.Value(bool).init(false),
+            .active = std.atomic.Value(bool).init(true),
             .comm_data = .{
                 .received_sequences = initMapCapacity(u24, void, server.options.allocator, 16),
                 .lost_sequences = initMapCapacity(u24, void, server.options.allocator, 16),
@@ -98,7 +141,7 @@ pub const Connection = struct {
                 .fragments_queue = initMapCapacity(u16, FragmentSet, server.options.allocator, 8),
                 .fragments_activity = initMapCapacity(u16, Timestamp, server.options.allocator, 8),
             },
-            .last_receive = Timestamp.now(server.io, .awake),
+            .last_receive_ns = std.atomic.Value(u64).init(@intCast(Timestamp.now(server.io, .awake).nanoseconds)),
             .created_at = Timestamp.now(server.io, .awake),
         };
     }
@@ -108,7 +151,7 @@ pub const Connection = struct {
             self.server.options.allocator.free(pending);
             self.pending_movement = null;
         }
-        self.comm_data.deinit(self.server.options.allocator);
+        self.comm_data.deinit(self.server.options.allocator, &self.server.output_slab);
     }
 
     pub fn handlePacket(self: *Self, payload: []const u8) !void {
@@ -136,12 +179,12 @@ pub const Connection = struct {
 
                 var accepted_buf: [Proto.ConnectionRequestAccepted.MAX_SERIALIZED_SIZE]u8 = undefined;
                 const serialized = try accepted.serializeInto(&accepted_buf);
-                const frame = try frameIn(serialized, allocator);
+                const frame = try self.frameIn(serialized);
 
                 self.sendFrame(frame, .Immediate);
             },
             Proto.Packets.NewIncomingConnection => {
-                self.connected = true;
+                self.connected.store(true, .release);
                 const elapsed = self.created_at.untilNow(self.server.io, .awake);
 
                 if (DEBUG)
@@ -151,8 +194,8 @@ pub const Connection = struct {
                 self.pending_connect_event = true;
             },
             Proto.Packets.DisconnectNotification => {
-                self.connected = false;
-                self.active = false;
+                self.connected.store(false, .release);
+                self.deactivate();
             },
             254 => {
                 // Game packet - trigger connection game packet callback
@@ -178,7 +221,7 @@ pub const Connection = struct {
                     return;
                 };
 
-                const frame = try frameIn(serialized, allocator);
+                const frame = try self.frameIn(serialized);
                 self.sendFrame(frame, .Immediate);
             },
             Proto.Packets.ConnectedPong => {
@@ -206,20 +249,25 @@ pub const Connection = struct {
     }
 
     pub fn tick(self: *Connection) void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
-        const elapsed = self.last_receive.untilNow(self.server.io, .awake);
+        const now = Timestamp.now(self.server.io, .awake);
+        const last_receive = Timestamp.fromNanoseconds(@intCast(self.last_receive_ns.load(.acquire)));
+        const elapsed = last_receive.untilNow(self.server.io, .awake);
 
         if (elapsed.toMilliseconds() > 15000) {
             Logger.WARN("Connection {any} has not received any packets in 15000ms", .{self.address});
-            self.active = false;
+            self.deactivate();
             return;
         }
 
-        const now = Timestamp.now(self.server.io, .awake);
-
-        self.purgeStaleFragments(now);
+        // Fragment state is guarded by the shard lock, which the socket handler also holds.
+        {
+            const token = self.server.registry.lock(self.server.io, self.key);
+            defer self.server.registry.unlock(self.server.io, token);
+            self.purgeStaleFragments(now);
+        }
         self.flushPendingMovement();
 
         self.send_mutex.lock(self.server.io) catch |err| {
@@ -235,51 +283,40 @@ pub const Connection = struct {
 
         self.send_mutex.unlock(self.server.io);
 
-        if (self.comm_data.received_sequences.count() > 0) {
-            var batch_storage: [MAX_ACK_BATCH]u32 = undefined;
-            var batch_len: usize = 0;
-            var iter = self.comm_data.received_sequences.keyIterator();
-            while (iter.next()) |key| {
-                if (batch_len == batch_storage.len) break;
-                batch_storage[batch_len] = key.*;
-                batch_len += 1;
-            }
-            if (batch_len > 0) {
-                const batch = batch_storage[0..batch_len];
-                std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
-                var ack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
-                const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Ack, &ack_buf) catch |err| {
-                    Logger.ERROR("Failed to serialize ack: {any}", .{err});
-                    return;
-                };
-                for (batch) |seq| _ = self.comm_data.received_sequences.remove(@truncate(seq));
-                self.send(serialized);
-            }
+        // Collected under the shard lock, serialized outside it. MAX_ACK_BATCH fits
+        // DATAGRAM_SCRATCH_SIZE at comptime, so serialization cannot fail.
+        var ack_storage: [MAX_ACK_BATCH]u32 = undefined;
+        var ack_len: usize = 0;
+        var nack_storage: [MAX_ACK_BATCH]u32 = undefined;
+        var nack_len: usize = 0;
+        {
+            const token = self.server.registry.lock(self.server.io, self.key);
+            defer self.server.registry.unlock(self.server.io, token);
+            ack_len = collectSequences(&self.comm_data.received_sequences, &ack_storage);
+            nack_len = collectSequences(&self.comm_data.lost_sequences, &nack_storage);
         }
-        if (self.comm_data.lost_sequences.count() > 0) {
-            var batch_storage: [MAX_ACK_BATCH]u32 = undefined;
-            var batch_len: usize = 0;
-            var iter = self.comm_data.lost_sequences.keyIterator();
-            while (iter.next()) |key| {
-                if (batch_len == batch_storage.len) break;
-                batch_storage[batch_len] = key.*;
-                batch_len += 1;
-            }
-            if (batch_len > 0) {
-                const batch = batch_storage[0..batch_len];
-                std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
-                var nack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
-                const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Nack, &nack_buf) catch |err| {
-                    Logger.ERROR("Failed to serialize nack: {any}", .{err});
-                    return;
-                };
-                for (batch) |seq| _ = self.comm_data.lost_sequences.remove(@truncate(seq));
-                self.send(serialized);
-            }
+        if (ack_len > 0) {
+            const batch = ack_storage[0..ack_len];
+            std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
+            var ack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
+            const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Ack, &ack_buf) catch |err| {
+                Logger.ERROR("Failed to serialize ack: {any}", .{err});
+                return;
+            };
+            self.sendTransient(serialized);
+        }
+        if (nack_len > 0) {
+            const batch = nack_storage[0..nack_len];
+            std.mem.sort(u32, batch, {}, comptime std.sort.asc(u32));
+            var nack_buf: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
+            const serialized = Proto.Ack.serializeInto(batch, Proto.Packets.Nack, &nack_buf) catch |err| {
+                Logger.ERROR("Failed to serialize nack: {any}", .{err});
+                return;
+            };
+            self.sendTransient(serialized);
         }
 
-        // Send ping every ping_interval milliseconds if connected
-        if (self.connected) {
+        if (self.isConnected()) {
             const since_last_ping = self.last_ping_time.durationTo(now);
 
             if (since_last_ping.nanoseconds >= self.ping_interval.nanoseconds) {
@@ -297,12 +334,11 @@ pub const Connection = struct {
     }
 
     pub fn handleAck(self: *Self, payload: []const u8) !void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        var ack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
-        defer ack.deinit();
+        const ack = try Proto.Ack.deserializeView(payload, &ack_scratch);
 
         // output_backup belongs to send_mutex
         self.send_mutex.lock(self.server.io) catch |err| {
@@ -313,9 +349,7 @@ pub const Connection = struct {
 
         for (ack.sequences) |seq| {
             const key: u24 = @truncate(seq);
-            if (self.comm_data.output_backup.fetchRemove(key)) |entry| {
-                self.server.options.allocator.free(entry.value.bytes);
-            }
+            if (self.comm_data.output_backup.fetchRemove(key)) |entry| self.releaseBackup(entry.value);
         }
 
         if (start_time) |start| {
@@ -325,12 +359,11 @@ pub const Connection = struct {
     }
 
     pub fn handleNack(self: *Self, payload: []const u8) !void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        var nack = try Proto.Ack.deserialize(payload, self.server.options.allocator);
-        defer nack.deinit();
+        const nack = try Proto.Ack.deserializeView(payload, &ack_scratch);
 
         self.send_mutex.lock(self.server.io) catch |err| {
             Logger.WARN("mutex lock failed: {}", .{err});
@@ -342,7 +375,7 @@ pub const Connection = struct {
         for (nack.sequences) |seq| {
             const key: u24 = @truncate(seq);
             if (self.comm_data.output_backup.getPtr(key)) |entry| {
-                self.send(entry.bytes);
+                self.sendPrepared(entry.bytes, entry.slot);
                 entry.sent_ns = @intCast(now.nanoseconds);
                 entry.retries += 1;
             }
@@ -355,12 +388,16 @@ pub const Connection = struct {
     }
 
     pub fn onFrameSet(self: *Self, buffer: []const u8) !void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
-        self.last_receive = Timestamp.now(self.server.io, .awake);
+        self.last_receive_ns.store(@intCast(Timestamp.now(self.server.io, .awake).nanoseconds), .release);
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
-        var frameSet = try Proto.FrameSet.deserialize(buffer, self.server.options.allocator);
+        // Frames use the thread-local scratch; oversized framesets fall back to the heap.
+        var frameSet = Proto.FrameSet.deserializeInto(buffer, &frameset_scratch) catch |err| switch (err) {
+            error.TooManyFrames => try Proto.FrameSet.deserialize(buffer, self.server.options.allocator),
+            else => return err,
+        };
         defer frameSet.deinit(self.server.options.allocator);
 
         const sequence = frameSet.sequence_number;
@@ -409,7 +446,7 @@ pub const Connection = struct {
     }
 
     pub fn handleFrame(self: *Connection, frame: Frame) !void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
@@ -438,7 +475,7 @@ pub const Connection = struct {
     }
 
     pub fn handleOrderedFrame(self: *Connection, frame: Frame) void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
@@ -748,15 +785,16 @@ pub const Connection = struct {
         return &(slot.*.?);
     }
 
-    pub fn frameIn(msg: []const u8, allocator: std.mem.Allocator) !Frame {
+    pub fn frameIn(self: *Connection, msg: []const u8) !Frame {
+        const allocator = self.server.options.allocator;
         const payload_copy = try allocator.dupe(u8, msg);
         return Frame.init(null, null, null, 0, Reliability.ReliableOrdered, payload_copy, null, null, null, allocator);
     }
 
     pub fn sendReliableMessage(self: *Connection, msg: []const u8, priority: Priority) void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
 
-        var frame = frameIn(msg, self.server.options.allocator) catch |err| {
+        var frame = self.frameIn(msg) catch |err| {
             Logger.ERROR("Failed to allocate reliable message: {any}", .{err});
             return;
         };
@@ -765,8 +803,76 @@ pub const Connection = struct {
         self.sendFrame(frame, priority);
     }
 
+    /// Takes ownership of `msg`; freed once the frame is serialized or dropped.
+    pub fn sendReliableMessageOwned(self: *Connection, msg: []const u8, priority: Priority) void {
+        if (!self.server.options.output_arena) {
+            self.sendReliableMessage(msg, priority);
+            self.server.options.allocator.free(msg);
+            return;
+        }
+        if (!self.isActive()) {
+            self.server.options.allocator.free(msg);
+            return;
+        }
+
+        var frame = Frame.init(null, null, null, 0, Reliability.ReliableOrdered, msg, null, null, null, self.server.options.allocator);
+        frame.reliability = Reliability.ReliableOrdered;
+        self.sendFrame(frame, priority);
+    }
+
+    /// Retains `shared` until the frame is retired; the caller keeps its own reference.
+    pub fn sendReliableMessageShared(self: *Connection, shared: *SharedPayload, priority: Priority) void {
+        if (!self.server.options.output_arena) {
+            self.sendReliableMessage(shared.bytes, priority);
+            return;
+        }
+        if (!self.isActive()) return;
+
+        shared.retain();
+        var frame = Frame.init(null, null, null, 0, Reliability.ReliableOrdered, shared.bytes, null, null, null, null);
+        frame.reliability = Reliability.ReliableOrdered;
+        frame.shared = shared;
+        self.sendFrame(frame, priority);
+    }
+
+    /// Writes the batch straight into an output slab slot. `packets` is only
+    /// read during this call.
+    pub fn sendPacketBatch(self: *Connection, packets: []const []const u8, priority: Priority) void {
+        if (!self.isActive()) return;
+        if (!self.server.options.output_arena) {
+            self.sendBatchCopied(packets, priority);
+            return;
+        }
+
+        var frame = Frame.initPacketBatch(packets, Reliability.ReliableOrdered, 0, null);
+        if (!self.sendBorrowedFrame(&frame)) {
+            // Batch too large for a slot, or pool exhausted.
+            self.sendBatchCopied(packets, priority);
+        }
+    }
+
+    fn sendBatchCopied(self: *Connection, packets: []const []const u8, priority: Priority) void {
+        const allocator = self.server.options.allocator;
+        var framed_size: usize = 2; // [254][0xFF] header
+        for (packets) |packet| framed_size += varintSize(packet.len) + packet.len;
+
+        const buffer = allocator.alloc(u8, framed_size) catch return;
+        buffer[0] = 254;
+        buffer[1] = 0xFF;
+        var pos: usize = 2;
+        for (packets) |packet| {
+            pos += writeVarInt(buffer[pos..], packet.len);
+            @memcpy(buffer[pos..][0..packet.len], packet);
+            pos += packet.len;
+        }
+
+        var frame = Frame.init(null, null, null, 0, Reliability.ReliableOrdered, buffer, null, null, null, allocator);
+        frame.reliability = Reliability.ReliableOrdered;
+        self.sendFrame(frame, priority);
+    }
+
     pub fn sendMovementReliableMessage(self: *Connection, msg: []const u8) void {
-        if (!self.active) return;
+        if (!self.isActive()) return;
         const allocator = self.server.options.allocator;
         const copy = allocator.dupe(u8, msg) catch {
             self.comm_data.movement_dropped += 1;
@@ -799,7 +905,7 @@ pub const Connection = struct {
     }
 
     pub fn sendFrame(self: *Connection, frame: Frame, priority: Priority) void {
-        if (!self.active) {
+        if (!self.isActive()) {
             var f = frame;
             f.deinit();
             return;
@@ -858,6 +964,100 @@ pub const Connection = struct {
         }
     }
 
+    const FramesetBackup = struct {
+        bytes: []const u8,
+        slot: ?u32 = null,
+    };
+
+    /// Slab slot if available, heap copy otherwise. Null means nothing was sent.
+    /// Caller holds send_mutex.
+    fn buildFramesetBackup(self: *Connection, sequence: u24, frames: []const Frame) ?FramesetBackup {
+        const allocator = self.server.options.allocator;
+        if (self.server.options.output_arena) {
+            if (self.server.output_slab.claim()) |slot| {
+                const bytes = Proto.FrameSet.serializeInto(sequence, frames, self.server.output_slab.slotBytes(slot)) catch |err| {
+                    Logger.ERROR("Failed to serialize frameset: {any}", .{err});
+                    self.server.output_slab.release(slot);
+                    return null;
+                };
+                return .{ .bytes = bytes, .slot = slot };
+            }
+        }
+
+        var scratch: [DATAGRAM_SCRATCH_SIZE]u8 = undefined;
+        const serialized = Proto.FrameSet.serializeInto(sequence, frames, &scratch) catch |err| {
+            Logger.ERROR("Failed to serialize frameset: {any}", .{err});
+            return null;
+        };
+        const backup = allocator.dupe(u8, serialized) catch |err| {
+            Logger.ERROR("Backup alloc failed: {any}", .{err});
+            return null;
+        };
+        return .{ .bytes = backup };
+    }
+
+    fn releaseBackup(self: *Connection, entry: BackupEntry) void {
+        if (entry.slot) |slot| {
+            self.server.output_slab.release(slot);
+            return;
+        }
+        if (entry.bytes.len > 0) {
+            self.server.options.allocator.free(@constCast(entry.bytes));
+        }
+    }
+
+    /// Sends a borrowed frame immediately, bypassing the queue. Returns false
+    /// (without consuming ordering indices) if it doesn't fit a slot.
+    fn sendBorrowedFrame(self: *Connection, frame: *Frame) bool {
+        if (!self.isActive()) return true;
+
+        self.send_mutex.lock(self.server.io) catch {
+            Logger.WARN("mutex lock failed on borrowed send", .{});
+            return false;
+        };
+        defer self.send_mutex.unlock(self.server.io);
+
+        const max_frameset_size = @min(self.mtu_size - 28, DATAGRAM_SCRATCH_SIZE);
+        if (4 + frame.getByteLength() > max_frameset_size) return false;
+
+        const channel: usize = 0;
+        frame.order_channel = 0;
+        frame.ordered_frame_index = self.comm_data.output_order_index[channel];
+        frame.reliable_frame_index = self.comm_data.output_reliable_index;
+
+        const slot = self.server.output_slab.claim() orelse return false;
+        const sequence: u24 = @truncate(self.comm_data.output_sequence);
+        const frames = [_]Frame{frame.*};
+        const serialized = Proto.FrameSet.serializeInto(sequence, &frames, self.server.output_slab.slotBytes(slot)) catch |err| {
+            Logger.ERROR("Failed to serialize packet batch: {any}", .{err});
+            self.server.output_slab.release(slot);
+            return false;
+        };
+
+        self.comm_data.output_order_index[channel] += 1;
+        self.comm_data.output_sequence_index[channel] = 0;
+        self.comm_data.output_reliable_index += 1;
+        self.comm_data.output_sequence += 1;
+
+        const now = Timestamp.now(self.server.io, .awake);
+        var backed_up = true;
+        if (self.comm_data.output_backup.fetchRemove(sequence)) |old| self.releaseBackup(old.value);
+        self.comm_data.output_backup.put(sequence, .{
+            .bytes = serialized,
+            .sent_ns = @intCast(now.nanoseconds),
+            .retries = 0,
+            .slot = slot,
+        }) catch |err| {
+            Logger.WARN("Backup store failed, sending without reliability: {any}", .{err});
+            backed_up = false;
+        };
+
+        self.sendPrepared(serialized, slot);
+        self.comm_data.output_frames_sent += 1;
+        if (!backed_up) self.releaseBackup(.{ .bytes = serialized, .slot = slot, .sent_ns = 0, .retries = 0 });
+        return true;
+    }
+
     pub fn handleLargePayload(
         self: *Connection,
         frame: *Frame,
@@ -872,7 +1072,46 @@ pub const Connection = struct {
 
         // Store original payload reference before we start fragmenting
         const original_payload = frame.payload;
-        defer allocator.free(original_payload); // Free the original frame's payload after fragmenting
+
+        // Fragments are slices of the original buffer, each holding one reference;
+        // the last fragment retired frees it. The legacy path duplicates per fragment.
+        if (self.server.options.output_arena) {
+            const wrapper = SharedPayload.create(allocator, @constCast(original_payload)) catch {
+                allocator.free(original_payload);
+                frame.payload = &.{};
+                frame.allocator = null;
+                return;
+            };
+            // Drops the frame's original reference once every fragment holds its own.
+            defer wrapper.release();
+
+            var index: usize = 0;
+            while (index < original_payload.len) {
+                const end_index = @min(index + max_size, original_payload.len);
+                wrapper.retain();
+                var new_frame = Frame.init(frame.reliable_frame_index, frame.sequence_frame_index, frame.ordered_frame_index, frame.order_channel, frame.reliability, original_payload[index..end_index], @as(u32, @intCast(index / max_size)), // split_frame_index
+                    split_id, // split_id
+                    @as(u32, @intCast(split_size)), // split_size
+                    null);
+                new_frame.shared = wrapper;
+
+                if (new_frame.isReliable()) {
+                    new_frame.reliable_frame_index = self.comm_data.output_reliable_index;
+                    self.comm_data.output_reliable_index += 1;
+                }
+
+                self.queueFrameLocked(new_frame, priority);
+                index += max_size;
+            }
+            return;
+        }
+
+        // Legacy path: one duplicate per fragment; the original goes away.
+        defer {
+            allocator.free(original_payload);
+            frame.payload = &.{};
+            frame.allocator = null;
+        }
 
         var index: usize = 0;
         while (index < original_payload.len) {
@@ -904,7 +1143,7 @@ pub const Connection = struct {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
 
         // Don't queue frames if connection is not active - prevents leaks during shutdown
-        if (!self.active) {
+        if (!self.isActive()) {
             var f = frame;
             f.deinit();
             return;
@@ -953,7 +1192,6 @@ pub const Connection = struct {
     // caller holds send_mutex
     fn sendQueueLocked(self: *Connection, amount: usize, budget_ns: i64) void {
         const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
-        const allocator = self.server.options.allocator;
         const now = Timestamp.now(self.server.io, .awake);
         const budget_started = now;
 
@@ -988,16 +1226,7 @@ pub const Connection = struct {
             const sequence: u24 = @truncate(self.comm_data.output_sequence);
             self.comm_data.output_sequence += 1;
 
-            const serialized = Proto.FrameSet.serializeInto(sequence, frames, self.send_scratch[0..]) catch |err| {
-                Logger.ERROR("Failed to serialize frameset: {any}", .{err});
-                for (frames) |*frame| frame.deinit();
-                self.advanceQueueHead(fit);
-                processed += fit;
-                continue;
-            };
-
-            const backup_bytes = allocator.dupe(u8, serialized) catch |err| {
-                Logger.ERROR("Backup alloc failed: {any}", .{err});
+            const backup = self.buildFramesetBackup(sequence, frames) orelse {
                 for (frames) |*frame| frame.deinit();
                 self.advanceQueueHead(fit);
                 processed += fit;
@@ -1005,23 +1234,26 @@ pub const Connection = struct {
             };
 
             // retire whatever previously occupied this sequence slot (u24 wrap)
-            if (self.comm_data.output_backup.fetchRemove(sequence)) |old| {
-                allocator.free(old.value.bytes);
-            }
+            if (self.comm_data.output_backup.fetchRemove(sequence)) |old| self.releaseBackup(old.value);
 
+            var backed_up = true;
             self.comm_data.output_backup.put(sequence, .{
-                .bytes = backup_bytes,
+                .bytes = backup.bytes,
                 .sent_ns = @intCast(now.nanoseconds),
                 .retries = 0,
+                .slot = backup.slot,
             }) catch |err| {
                 Logger.WARN("Backup store failed, sending without reliability: {any}", .{err});
-                allocator.free(backup_bytes);
+                backed_up = false;
             };
 
-            self.send(serialized);
+            self.sendPrepared(backup.bytes, backup.slot);
             self.comm_data.output_frames_sent += fit;
+            if (!backed_up) self.releaseBackup(.{ .bytes = backup.bytes, .slot = backup.slot, .sent_ns = 0, .retries = 0 });
 
-            for (frames) |*frame| frame.deinit();
+            for (frames) |*frame| {
+                frame.deinit();
+            }
             self.advanceQueueHead(fit);
             processed += fit;
         }
@@ -1047,31 +1279,31 @@ pub const Connection = struct {
             if (entry.value_ptr.retries >= MAX_RETRANSMITS) {
                 Logger.WARN("Connection {any} unresponsive (sequence {d} unacked after {d} retries)", .{ self.address, entry.key_ptr.*, entry.value_ptr.retries });
                 dropped_key = entry.key_ptr.*;
-                self.active = false;
+                self.deactivate();
                 break;
             }
 
-            self.send(entry.value_ptr.bytes);
+            self.sendPrepared(entry.value_ptr.bytes, entry.value_ptr.slot);
             entry.value_ptr.sent_ns = @intCast(now.nanoseconds);
             entry.value_ptr.retries += 1;
             resent += 1;
         }
 
         if (dropped_key) |key| {
-            if (self.comm_data.output_backup.fetchRemove(key)) |entry| {
-                self.server.options.allocator.free(entry.value.bytes);
-            }
+            if (self.comm_data.output_backup.fetchRemove(key)) |entry| self.releaseBackup(entry.value);
         }
     }
 
-    pub fn send(self: *Connection, data: []const u8) void {
-        const start_time: ?Timestamp = if (PERFORM_TIME_CHECKS) .now(self.server.io, .awake) else null;
+    /// Queues a frameset already serialized in an output slab slot, which the
+    /// queue retains while in flight. Sends directly if the sender thread is
+    /// disabled or the ring is full.
+    pub fn sendPrepared(self: *Connection, bytes: []const u8, slot: ?u32) void {
+        self.server.submitDatagram(self.address, bytes, slot);
+    }
 
-        self.server.send(data, self.address);
-        if (start_time) |start| {
-            const elapsed = start.untilNow(self.server.io, .awake);
-            Logger.DEBUG("PERF: send took {d} ms", .{elapsed.toMilliseconds()});
-        }
+    /// Copies `bytes` into the transient pool, since the caller's buffer is on the stack.
+    pub fn sendTransient(self: *Connection, bytes: []const u8) void {
+        self.server.submitTransient(self.address, bytes);
     }
 
     pub fn takePendingConnect(self: *Self) bool {
@@ -1091,16 +1323,20 @@ pub const Connection = struct {
     }
 
     pub fn isConnected(self: *const Connection) bool {
-        return self.connected;
+        return self.connected.load(.acquire);
     }
 
     pub fn isActive(self: *const Connection) bool {
-        return self.active;
+        return self.active.load(.acquire);
+    }
+
+    /// Callable from any thread; the shard owner retires the connection on its next pass.
+    pub fn deactivate(self: *Connection) void {
+        self.active.store(false, .release);
     }
 
     /// Send a ConnectedPing packet to the client
     pub fn sendPing(self: *Connection) void {
-        const allocator = self.server.options.allocator;
         const timestamp = Timestamp.now(self.server.io, .real).toMilliseconds();
 
         var ping = Proto.ConnectedPing.init(timestamp);
@@ -1112,7 +1348,7 @@ pub const Connection = struct {
             return;
         };
 
-        const frame = frameIn(serialized, allocator) catch |err| {
+        const frame = self.frameIn(serialized) catch |err| {
             Logger.ERROR("Failed to allocate ping frame: {any}", .{err});
             return;
         };
@@ -1145,7 +1381,7 @@ pub const CommData = struct {
     movement_coalesced: u64 = 0,
     movement_dropped: u64 = 0,
 
-    pub fn deinit(self: *CommData, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CommData, allocator: std.mem.Allocator, slab: *OutputSlab) void {
         self.received_sequences.deinit();
         self.lost_sequences.deinit();
 
@@ -1167,7 +1403,11 @@ pub const CommData = struct {
 
         var backup_iter = self.output_backup.iterator();
         while (backup_iter.next()) |entry| {
-            allocator.free(entry.value_ptr.bytes);
+            if (entry.value_ptr.slot) |slot| {
+                slab.release(slot);
+            } else if (entry.value_ptr.bytes.len > 0) {
+                allocator.free(@constCast(entry.value_ptr.bytes));
+            }
         }
         self.output_backup.deinit();
 
