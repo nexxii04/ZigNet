@@ -33,11 +33,49 @@ fn writeVarInt(buffer: []u8, value: usize) usize {
 
 const MAX_CHANNELS = 32;
 const MAX_ORDERING_QUEUE_SIZE = 64;
+const MAX_PENDING_GAME_BYTES = 1024 * 1024;
 const MAX_SPLIT_SIZE: u32 = 1024;
 const MAX_FRAGMENT_SETS = 256;
 const FRAGMENT_TIMEOUT_NS: i64 = 10 * std.time.ns_per_s;
 const MAX_LOST_GAP: u32 = 4096;
 const MAX_PENDING_SEQUENCES = 8192;
+const RECEIVE_WINDOW_SIZE = 8192;
+const SEQUENCE_HALF_RANGE: u24 = 1 << 23;
+
+fn sequenceAhead(sequence: u24, previous: u24) bool {
+    const distance = sequence -% previous;
+    return distance != 0 and distance < SEQUENCE_HALF_RANGE;
+}
+
+const ReceiveWindow = struct {
+    newest: ?u24 = null,
+    seen: std.StaticBitSet(RECEIVE_WINDOW_SIZE) = .initEmpty(),
+
+    fn record(self: *ReceiveWindow, sequence: u24) bool {
+        if (self.newest) |previous| {
+            if (sequenceAhead(sequence, previous)) {
+                const distance = sequence -% previous;
+                if (distance >= RECEIVE_WINDOW_SIZE) {
+                    self.seen = .initEmpty();
+                } else {
+                    var step: u24 = 1;
+                    while (step <= distance) : (step += 1) {
+                        self.seen.unset((previous +% step) % RECEIVE_WINDOW_SIZE);
+                    }
+                }
+                self.newest = sequence;
+            } else if (previous -% sequence >= RECEIVE_WINDOW_SIZE) {
+                return false;
+            }
+        } else {
+            self.newest = sequence;
+        }
+        const slot = sequence % RECEIVE_WINDOW_SIZE;
+        if (self.seen.isSet(slot)) return false;
+        self.seen.set(slot);
+        return true;
+    }
+};
 const RETRANSMIT_TIMEOUT_NS: i64 = 200 * std.time.ns_per_ms;
 const MAX_RETRANSMITS: u8 = 10;
 const MAX_RETRANSMITS_PER_TICK: usize = 32;
@@ -54,6 +92,8 @@ const MAX_SEND_NS: i64 = 5 * std.time.ns_per_ms;
 const DATAGRAM_SCRATCH_SIZE = 1600;
 
 comptime {
+    std.debug.assert((1 << 24) % RECEIVE_WINDOW_SIZE == 0);
+    std.debug.assert(RECEIVE_WINDOW_SIZE < SEQUENCE_HALF_RANGE);
     std.debug.assert(3 + MAX_ACK_BATCH * 4 <= DATAGRAM_SCRATCH_SIZE);
     std.debug.assert(DATAGRAM_SCRATCH_SIZE >= ServerModule.MAX_MTU_SIZE);
 }
@@ -114,6 +154,8 @@ pub const Connection = struct {
     ping_interval: std.Io.Duration = .fromMilliseconds(5000),
     send_mutex: std.Io.Mutex = .init,
     pending_connect_event: bool = false,
+    pending_game_packets: std.ArrayList([]u8) = .empty,
+    pending_game_bytes: usize = 0,
     pending_movement: ?[]u8 = null,
 
     pub fn init(server: *Server, address: std.Io.net.IpAddress, mtu_size: u16, guid: i64) Self {
@@ -147,6 +189,8 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.pending_game_packets.items) |bytes| self.server.options.allocator.free(bytes);
+        self.pending_game_packets.deinit(self.server.options.allocator);
         if (self.pending_movement) |pending| {
             self.server.options.allocator.free(pending);
             self.pending_movement = null;
@@ -198,6 +242,18 @@ pub const Connection = struct {
                 self.deactivate();
             },
             254 => {
+                if (self.pending_connect_event) {
+                    if (self.pending_game_packets.items.len >= MAX_ORDERING_QUEUE_SIZE or
+                        payload.len > MAX_PENDING_GAME_BYTES - self.pending_game_bytes) return error.PendingGameQueueFull;
+
+                    const copy = try allocator.dupe(u8, payload);
+                    errdefer allocator.free(copy);
+
+                    try self.pending_game_packets.append(allocator, copy);
+                    self.pending_game_bytes += copy.len;
+                    return;
+                }
+
                 // Game packet - trigger connection game packet callback
                 if (self.game_packet_callback) |callback| {
                     callback(self, payload, self.game_packet_context);
@@ -401,40 +457,47 @@ pub const Connection = struct {
         defer frameSet.deinit(self.server.options.allocator);
 
         const sequence = frameSet.sequence_number;
-        const last = self.comm_data.last_input_sequence;
-        const is_older_than_last = last != -1 and sequence <= @as(u24, @intCast(@max(0, last)));
-        const is_already_received = self.comm_data.received_sequences.contains(sequence);
+        const previous = self.comm_data.datagram_history.newest;
+        const advances = previous == null or sequenceAhead(sequence, previous.?);
+        const distance: u24 = if (previous) |last| sequence -% last else sequence +% 1;
+        const gap: u32 = if (distance > 0) distance - 1 else 0;
 
-        if (is_older_than_last or is_already_received) {
-            return;
+        if (advances and gap > 0 and gap <= MAX_LOST_GAP) {
+            const capacity = @min(gap, MAX_PENDING_SEQUENCES - self.comm_data.lost_sequences.count());
+            try self.comm_data.lost_sequences.ensureUnusedCapacity(@intCast(capacity));
         }
 
-        if (self.comm_data.received_sequences.count() >= MAX_PENDING_SEQUENCES) {
-            self.comm_data.received_sequences.clearRetainingCapacity();
-        }
-
-        self.comm_data.received_sequences.put(sequence, {}) catch {
-            return;
-        };
-
+        if (self.comm_data.received_sequences.count() >= MAX_PENDING_SEQUENCES and
+            !self.comm_data.received_sequences.contains(sequence)) return error.PendingAckQueueFull;
+        try self.comm_data.received_sequences.put(sequence, {});
         _ = self.comm_data.lost_sequences.remove(sequence);
 
-        // big jumps are client restarts, not real loss
-        if (last >= 0 and sequence > last) {
-            const last_u32: u32 = @intCast(last);
-            if (sequence > last_u32) {
-                const gap: u32 = @as(u32, sequence) - last_u32 - 1;
-                if (gap > 0 and gap <= MAX_LOST_GAP) {
-                    var i: u32 = last_u32 + 1;
-                    while (i < sequence) : (i += 1) {
-                        if (self.comm_data.lost_sequences.count() >= MAX_PENDING_SEQUENCES) break;
-                        self.comm_data.lost_sequences.put(@truncate(i), {}) catch break;
+        if (!self.comm_data.datagram_history.record(sequence)) return;
+
+        if (advances) {
+            // Expire NACKs as their sequences leave the bounded receive window.
+            // Iterate the evicted slots rather than scanning the whole map.
+            if (previous) |last| {
+                if (distance >= RECEIVE_WINDOW_SIZE) {
+                    self.comm_data.lost_sequences.clearRetainingCapacity();
+                } else {
+                    var step: u24 = 1;
+                    while (step <= distance) : (step += 1) {
+                        _ = self.comm_data.lost_sequences.remove(last +% step -% RECEIVE_WINDOW_SIZE);
                     }
                 }
             }
+            if (gap > 0 and gap <= MAX_LOST_GAP) {
+                var missing: u24 = if (previous) |last| last +% 1 else 0;
+                var i: u32 = 0;
+                while (i < gap) : (i += 1) {
+                    if (self.comm_data.lost_sequences.count() >= MAX_PENDING_SEQUENCES) break;
+                    self.comm_data.lost_sequences.putAssumeCapacity(missing, {});
+                    missing +%= 1;
+                }
+            }
+            self.comm_data.last_input_sequence = @intCast(sequence);
         }
-
-        self.comm_data.last_input_sequence = @as(i32, @intCast(sequence));
         for (frameSet.frames) |frame| {
             try self.handleFrame(frame);
         }
@@ -453,6 +516,12 @@ pub const Connection = struct {
         if (frame.payload.len == 0) {
             Logger.WARN("Frame has empty payload - skipping in handleFrame", .{});
             return;
+        }
+
+        if (frame.isReliable()) {
+            const index = frame.reliable_frame_index orelse return error.MissingReliableIndex;
+            if (index > std.math.maxInt(u24)) return error.InvalidReliableIndex;
+            if (!self.comm_data.reliable_history.record(@intCast(index))) return;
         }
 
         if (frame.isSplit()) {
@@ -494,9 +563,12 @@ pub const Connection = struct {
             return;
         };
 
-        if (frame_index == self.comm_data.input_order_index[channel]) {
+        if (frame_index > std.math.maxInt(u24)) return;
+        const expected: u24 = @truncate(self.comm_data.input_order_index[channel]);
+        const order: u24 = @intCast(frame_index);
+        if (order == expected) {
             self.comm_data.input_highest_sequence_index[channel] = 0;
-            self.comm_data.input_order_index[channel] = frame_index + 1;
+            self.comm_data.input_order_index[channel] = order +% 1;
 
             self.handlePacket(frame.payload) catch {
                 Logger.ERROR("Failed to handle packet", .{});
@@ -514,12 +586,13 @@ pub const Connection = struct {
                         return;
                     };
                     iframe.deinit();
-                    index += 1;
+                    index = @as(u24, @truncate(index)) +% 1;
                 }
                 self.comm_data.input_order_index[channel] = index;
             }
-        } else if (frame_index > self.comm_data.input_order_index[channel]) {
+        } else if (sequenceAhead(order, expected)) {
             if (self.orderingChannel(channel)) |queue| {
+                if (queue.contains(frame_index)) return;
                 if (queue.count() >= MAX_ORDERING_QUEUE_SIZE) {
                     Logger.WARN("Ordering queue full on channel {d}, dropping frame", .{channel});
                     return;
@@ -540,12 +613,8 @@ pub const Connection = struct {
                     return;
                 };
             }
-        } else {
-            self.handlePacket(frame.payload) catch {
-                Logger.ERROR("Failed to handle packet", .{});
-                return;
-            };
         }
+        // Stale order indexes have already been delivered: never replay them.
 
         if (start_time) |start| {
             const elapsed = start.untilNow(self.server.io, .awake);
@@ -1306,6 +1375,20 @@ pub const Connection = struct {
         self.server.submitTransient(self.address, bytes);
     }
 
+    /// Called after onConnect has installed the handler, under the shard lock
+    /// just like normal game delivery. Each copy is released exactly once.
+    pub fn drainPendingGamePackets(self: *Self) void {
+        defer {
+            for (self.pending_game_packets.items) |bytes| self.server.options.allocator.free(bytes);
+            self.pending_game_packets.clearRetainingCapacity();
+            self.pending_game_bytes = 0;
+        }
+        for (self.pending_game_packets.items) |bytes| {
+            if (!self.isActive()) break;
+            if (self.game_packet_callback) |callback| callback(self, bytes, self.game_packet_context);
+        }
+    }
+
     pub fn takePendingConnect(self: *Self) bool {
         const was_pending = self.pending_connect_event;
         self.pending_connect_event = false;
@@ -1358,6 +1441,8 @@ pub const Connection = struct {
 
 pub const CommData = struct {
     last_input_sequence: i32 = -1,
+    datagram_history: ReceiveWindow = .{},
+    reliable_history: ReceiveWindow = .{},
     received_sequences: std.AutoHashMap(u24, void),
     lost_sequences: std.AutoHashMap(u24, void),
     input_order_index: [MAX_CHANNELS]u32,

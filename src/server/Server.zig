@@ -583,6 +583,9 @@ pub const Server = struct {
                     if (self.connect_callback) |callback| {
                         callback(conn, self.connect_context);
                     }
+                    const token = self.registry.lock(self.io, key);
+                    defer self.registry.unlock(self.io, token);
+                    conn.drainPendingGamePackets();
                 }
             },
             Packets.Ack => {
@@ -1221,4 +1224,237 @@ test "concurrent socket handling cannot race a retirement pass" {
     stop.store(true, .release);
     producer.join();
     try std.testing.expectEqual(@as(usize, 1), disconnected.count);
+}
+
+// Exercise the wire parser and application callback, not just sequence arithmetic.
+const ReceiveTest = struct {
+    markers: [16]u8 = @splat(0),
+    count: usize = 0,
+
+    fn deliver(_: *Connection, payload: []const u8, context: ?*anyopaque) void {
+        const self: *ReceiveTest = @ptrCast(@alignCast(context.?));
+        if (self.count < self.markers.len and payload.len > 1) self.markers[self.count] = payload[1];
+        self.count += 1;
+    }
+
+    fn send(conn: *Connection, sequence: u24, reliable: ?u32, order: ?u32, marker: u8) !void {
+        const payload = [_]u8{ 0xfe, marker };
+        const frame = Proto.Frame.init(reliable, null, order, if (order != null) 0 else null, if (order != null) .ReliableOrdered else if (reliable != null) .Reliable else .Unreliable, &payload, null, null, null, null);
+        try sendFrame(conn, sequence, frame);
+    }
+
+    fn sendFrame(conn: *Connection, sequence: u24, frame: Proto.Frame) !void {
+        var buffer: [128]u8 = undefined;
+        const bytes = try Proto.FrameSet.serializeInto(sequence, &.{frame}, &buffer);
+        try conn.onFrameSet(bytes);
+    }
+};
+
+test "receive reordered datagrams delivers ordered payloads once and removes NACK" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 1, 1, 1, 22);
+    try std.testing.expectEqual(@as(usize, 0), received.count);
+    try std.testing.expect(conn.comm_data.lost_sequences.contains(0));
+    try ReceiveTest.send(&conn, 0, 0, 0, 11);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22 }, received.markers[0..received.count]);
+    try std.testing.expect(!conn.comm_data.lost_sequences.contains(0));
+    try std.testing.expectEqual(@as(i32, 1), conn.comm_data.last_input_sequence);
+    try ReceiveTest.send(&conn, 1, 1, 1, 22);
+    try std.testing.expectEqual(@as(usize, 2), received.count);
+}
+
+test "receive duplicate requeues ACK after tick without replaying unreliable payload" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 0, null, null, 11);
+    conn.tick(); // Actually consume the pending ACK batch.
+    try std.testing.expectEqual(@as(usize, 0), conn.comm_data.received_sequences.count());
+    try ReceiveTest.send(&conn, 0, null, null, 11);
+    try std.testing.expect(conn.comm_data.received_sequences.contains(0));
+    try std.testing.expectEqual(@as(usize, 1), received.count);
+}
+
+test "receive reliable retransmit in a new datagram does not replay payload" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 0, 0, null, 11);
+    try ReceiveTest.send(&conn, 1, 0, null, 11);
+    try std.testing.expect(conn.comm_data.received_sequences.contains(1));
+    try std.testing.expectEqual(@as(usize, 1), received.count);
+}
+
+test "receive duplicate queued and stale order indexes do not overwrite or replay" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 0, 0, 1, 22);
+    try ReceiveTest.send(&conn, 1, 1, 1, 99);
+    try ReceiveTest.send(&conn, 2, 2, 0, 11);
+    try ReceiveTest.send(&conn, 3, 3, 0, 99);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22 }, received.markers[0..received.count]);
+}
+
+test "receive late unseen unreliable datagram does not rewind highest sequence" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 0, null, null, 11);
+    try ReceiveTest.send(&conn, 2, null, null, 33);
+    try std.testing.expect(conn.comm_data.lost_sequences.contains(1));
+    try ReceiveTest.send(&conn, 1, null, null, 22);
+    try ReceiveTest.send(&conn, 1, null, null, 22);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 33, 22 }, received.markers[0..received.count]);
+    try std.testing.expectEqual(@as(i32, 2), conn.comm_data.last_input_sequence);
+    try std.testing.expect(!conn.comm_data.lost_sequences.contains(1));
+}
+
+test "receive datagram reliable and ordered indexes wrap u24 with a missing packet" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    const last = std.math.maxInt(u24);
+    conn.comm_data.input_order_index[0] = last - 1;
+    try ReceiveTest.send(&conn, last - 1, last - 1, last - 1, 11);
+    try ReceiveTest.send(&conn, 0, 0, 0, 33);
+    try std.testing.expect(conn.comm_data.lost_sequences.contains(last));
+    try ReceiveTest.send(&conn, last, last, last, 22);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33 }, received.markers[0..received.count]);
+    try std.testing.expectEqual(@as(i32, 0), conn.comm_data.last_input_sequence);
+    try std.testing.expectEqual(@as(u32, 1), conn.comm_data.input_order_index[0]);
+    try std.testing.expect(!conn.comm_data.lost_sequences.contains(last));
+    conn.tick();
+    try ReceiveTest.send(&conn, last, last, last, 22);
+    try std.testing.expect(conn.comm_data.received_sequences.contains(last));
+    try std.testing.expectEqual(@as(usize, 3), received.count);
+}
+
+test "receive reordered split fragments assemble once even when repacked" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    const first = Proto.Frame.init(0, null, 0, 0, .ReliableOrdered, &.{0xfe}, 0, 7, 2, null);
+    const second = Proto.Frame.init(1, null, 0, 0, .ReliableOrdered, &.{22}, 1, 7, 2, null);
+    try ReceiveTest.sendFrame(&conn, 1, second);
+    try ReceiveTest.sendFrame(&conn, 0, first);
+    try ReceiveTest.sendFrame(&conn, 2, first);
+    try ReceiveTest.sendFrame(&conn, 3, second);
+    try std.testing.expectEqualSlices(u8, &.{22}, received.markers[0..received.count]);
+    try std.testing.expectEqual(@as(usize, 0), conn.comm_data.fragments_queue.count());
+}
+
+test "receive full ACK queue preserves pending ACKs and permits retry after draining" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    var buffer: [4]u8 = undefined;
+    for (0..8192) |sequence| {
+        try conn.onFrameSet(try Proto.FrameSet.serializeInto(@intCast(sequence), &.{}, &buffer));
+    }
+    try std.testing.expectError(error.PendingAckQueueFull, ReceiveTest.send(&conn, 8192, null, null, 11));
+    try std.testing.expectEqual(@as(usize, 8192), conn.comm_data.received_sequences.count());
+    try std.testing.expectEqual(@as(i32, 8191), conn.comm_data.last_input_sequence);
+    try std.testing.expectEqual(@as(usize, 0), received.count);
+    conn.tick();
+    try ReceiveTest.send(&conn, 8192, null, null, 11);
+    try std.testing.expectEqual(@as(usize, 1), received.count);
+    // Sequence 0 is now retired. It is re-ACKed, never replayed after slot reuse.
+    conn.tick();
+    try ReceiveTest.send(&conn, 0, null, null, 99);
+    try std.testing.expectEqual(@as(usize, 1), received.count);
+    try std.testing.expect(conn.comm_data.received_sequences.contains(0));
+}
+
+test "receive large forward jumps expire NACKs and retain bounded history" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+    defer conn.deinit();
+    var received: ReceiveTest = .{};
+    conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+    try ReceiveTest.send(&conn, 1, null, null, 11);
+    try ReceiveTest.send(&conn, 10000, null, null, 22);
+    try std.testing.expectEqual(@as(usize, 0), conn.comm_data.lost_sequences.count());
+    try ReceiveTest.send(&conn, 0, null, null, 99);
+    try ReceiveTest.send(&conn, 10000 - 8191, null, null, 33);
+    try ReceiveTest.send(&conn, 10000 - 8191, null, null, 33);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33 }, received.markers[0..received.count]);
+    try std.testing.expectEqual(@as(i32, 10000), conn.comm_data.last_input_sequence);
+}
+
+test "receive all permutations of four ordered datagrams deliver exactly once" {
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0 });
+    defer server.deinit();
+    for (0..4) |a| for (0..4) |b| for (0..4) |c| for (0..4) |d| {
+        if (a == b or a == c or a == d or b == c or b == d or c == d) continue;
+        var conn = Connection.init(&server, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 1), 1400, 0);
+        defer conn.deinit();
+        var received: ReceiveTest = .{};
+        conn.setGamePacketCallback(ReceiveTest.deliver, &received);
+        for ([_]usize{ a, b, c, d }) |index| {
+            try ReceiveTest.send(&conn, @intCast(index), @intCast(index), @intCast(index), @intCast(index + 11));
+            conn.tick();
+            try ReceiveTest.send(&conn, @intCast(index), @intCast(index), @intCast(index), @intCast(index + 11));
+        }
+        try std.testing.expectEqualSlices(u8, &.{ 11, 12, 13, 14 }, received.markers[0..received.count]);
+        try std.testing.expectEqual(@as(usize, 0), conn.comm_data.lost_sequences.count());
+    };
+}
+
+test "receive reordered handshake defers game delivery until connect callback registers it" {
+    const State = struct {
+        received: ReceiveTest = .{},
+        connected: usize = 0,
+        fn connect(conn: *Connection, context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.connected += 1;
+            conn.setGamePacketCallback(ReceiveTest.deliver, &self.received);
+        }
+    };
+    var server = try Server.init(std.testing.io, .{ .allocator = std.testing.allocator, .port = 0, .shards = 1 });
+    defer server.deinit();
+    const conn = try testConnection(&server, std.testing.allocator);
+    try registerTestConnection(&server, std.testing.io, conn);
+    var state: State = .{};
+    server.setConnectCallback(State.connect, &state);
+    try ReceiveTest.send(conn, 2, 2, 2, 22);
+    // The late handshake frame drains the buffered game packet in the same
+    // onFrameSet call. Server must register the callback BEFORE game delivery.
+    var buffer: [128]u8 = undefined;
+    const handshake = Proto.Frame.init(0, null, 0, 0, .ReliableOrdered, &.{Proto.Packets.NewIncomingConnection}, null, null, null, null);
+    const game = Proto.Frame.init(1, null, 1, 0, .ReliableOrdered, &.{ 0xfe, 11 }, null, null, null, null);
+    const bytes = try Proto.FrameSet.serializeInto(0, &.{ handshake, game }, &buffer);
+    Server.packet_callback(bytes, conn.address, &server, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.connected);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22 }, state.received.markers[0..state.received.count]);
+    Server.packet_callback(bytes, conn.address, &server, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.connected);
+    try std.testing.expectEqual(@as(usize, 2), state.received.count);
 }
