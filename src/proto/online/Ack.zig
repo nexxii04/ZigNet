@@ -2,8 +2,13 @@ const std = @import("std");
 const Packets = @import("../Packets.zig").Packets;
 const BinaryStream = @import("BinaryStream").BinaryStream;
 
-// an MTU-sized datagram cannot reference more sequences than this
+// An MTU-sized datagram cannot reference more sequences than this.
 pub const MAX_SEQUENCES_PER_ACK = 4096;
+
+/// Borrowed view into the caller's scratch buffer; nothing to free.
+pub const AckView = struct {
+    sequences: []u32,
+};
 
 pub const Ack = struct {
     sequences: []u32,
@@ -22,12 +27,11 @@ pub const Ack = struct {
         self.allocator.free(self.sequences);
     }
 
-    /// DEALLOCATE THE RETURNED STRUCT AFTER USE
     pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !Ack {
         var stream = BinaryStream.init(allocator, data, 0);
         defer stream.deinit();
 
-        _ = try stream.readUint8(); // Read packet ID (UInt8, not VarInt)
+        _ = try stream.readUint8(); // packet ID, plain UInt8
         const record_count = try stream.readUint16(.Big);
 
         var sequences = std.ArrayList(u32).initBuffer(&[_]u32{});
@@ -38,8 +42,8 @@ pub const Ack = struct {
 
         var index: usize = 0;
         while (index < record_count) : (index += 1) {
-            const range = try stream.readBool(); // False for range, True for no range
-            if (range) {
+            const single = try stream.readBool();
+            if (single) {
                 if (sequences.items.len >= MAX_SEQUENCES_PER_ACK) return error.TooManySequences;
                 const value = try stream.readUint24(.Little);
                 try sequences.append(allocator, value);
@@ -59,7 +63,45 @@ pub const Ack = struct {
         return Ack.init(sequences.items, allocator);
     }
 
-    /// Writes into `out` (zero allocs); returns a slice of it. Sorted input.
+    /// Zero-alloc variant: `scratch.len` caps the number of sequences.
+    pub fn deserializeView(data: []const u8, scratch: []u32) !AckView {
+        var stream = BinaryStream{
+            .payload = @constCast(data),
+            .written = data.len,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        _ = try stream.readUint8();
+        const record_count = try stream.readUint16(.Big);
+
+        var len: usize = 0;
+        var index: usize = 0;
+        while (index < record_count) : (index += 1) {
+            const single = try stream.readBool();
+            if (single) {
+                if (len >= scratch.len or len >= MAX_SEQUENCES_PER_ACK) return error.TooManySequences;
+                scratch[len] = try stream.readUint24(.Little);
+                len += 1;
+            } else {
+                const start = try stream.readUint24(.Little);
+                const end = try stream.readUint24(.Little);
+                if (end < start) return error.InvalidRange;
+                if (end - start + 1 > MAX_SEQUENCES_PER_ACK) return error.RangeTooLarge;
+                if (len + (end - start + 1) > scratch.len or len + (end - start + 1) > MAX_SEQUENCES_PER_ACK) return error.TooManySequences;
+                var seq_index = start;
+                while (seq_index <= end) : (seq_index += 1) {
+                    scratch[len] = seq_index;
+                    len += 1;
+                }
+            }
+        }
+
+        return .{ .sequences = scratch[0..len] };
+    }
+
+    /// Zero-alloc; `sequences` must be sorted ascending.
     pub fn serializeInto(sequences: []const u32, packet_id: u8, out: []u8) ![]const u8 {
         var s = BinaryStream{
             .payload = out,
@@ -76,7 +118,7 @@ pub const Ack = struct {
             return s.getBuffer();
         }
 
-        // pass 1 counts runs so the record header can be written in place
+        // Count runs first so the record count can be written up front.
         var records: u16 = 0;
         var idx: usize = 0;
         while (idx < sequences.len) {
@@ -96,10 +138,10 @@ pub const Ack = struct {
             const end_value = sequences[run_end];
             if (start_value > 0xFFFFFF or end_value > 0xFFFFFF) return error.SequenceOutOfRange;
             if (start_value == end_value) {
-                try s.writeUint8(1); // true - single
+                try s.writeUint8(1);
                 try s.writeUint24(@truncate(start_value), .Little);
             } else {
-                try s.writeUint8(0); // false - range
+                try s.writeUint8(0);
                 try s.writeUint24(@truncate(start_value), .Little);
                 try s.writeUint24(@truncate(end_value), .Little);
             }
@@ -109,9 +151,8 @@ pub const Ack = struct {
         return s.getBuffer();
     }
 
-    /// Allocating wrapper; caller owns the result.
     pub fn serialize(self: *const Ack, allocator: std.mem.Allocator) ![]const u8 {
-        // Sequences may be unsorted; serializeInto requires ascending order.
+        // serializeInto requires ascending order.
         const sorted = try allocator.dupe(u32, self.sequences);
         defer allocator.free(sorted);
         std.mem.sort(u32, sorted, {}, comptime std.sort.asc(u32));
@@ -157,4 +198,28 @@ test "Ack deserialize rejects oversized ranges" {
     const allocator = std.testing.allocator;
     const malicious = [_]u8{ Packets.Ack, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF };
     try std.testing.expectError(error.RangeTooLarge, Ack.deserialize(&malicious, allocator));
+}
+
+test "Ack deserializeView borrows the scratch and matches deserialize" {
+    const allocator = std.testing.allocator;
+    const sequences = [_]u32{ 1, 2, 3, 5, 6, 10 };
+    var buffer: [256]u8 = undefined;
+    const serialized = try Ack.serializeInto(&sequences, Packets.Ack, &buffer);
+
+    var scratch: [16]u32 = undefined;
+    const view = try Ack.deserializeView(serialized, &scratch);
+    try std.testing.expectEqualSlices(u32, &sequences, view.sequences);
+
+    var owned = try Ack.deserialize(serialized, allocator);
+    defer owned.deinit();
+    try std.testing.expectEqualSlices(u32, owned.sequences, view.sequences);
+}
+
+test "Ack deserializeView rejects lists that do not fit the scratch" {
+    var buffer: [256]u8 = undefined;
+    const sequences = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const serialized = try Ack.serializeInto(&sequences, Packets.Nack, &buffer);
+
+    var scratch: [4]u32 = undefined;
+    try std.testing.expectError(error.TooManySequences, Ack.deserializeView(serialized, &scratch));
 }

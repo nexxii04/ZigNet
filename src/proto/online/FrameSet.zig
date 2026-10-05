@@ -47,6 +47,36 @@ pub const FrameSet = struct {
         return s.getBuffer();
     }
 
+    /// Zero-alloc: frames go into `frames_buf` and payloads borrow `buffer`.
+    /// Returns `error.TooManyFrames` if they don't fit.
+    pub fn deserializeInto(buffer: []const u8, frames_buf: []Frame) !FrameSet {
+        var stream = BinaryStream{
+            .payload = @constCast(buffer),
+            .written = buffer.len,
+            .offset = 0,
+            .allocator = undefined,
+            .owns_buffer = false,
+        };
+
+        _ = try stream.readUint8(); // packet type
+        const sequence_number = try stream.readUint24(.Little);
+
+        var count: usize = 0;
+        const end_position = stream.written;
+        while (stream.offset < end_position) {
+            if (count >= frames_buf.len) return error.TooManyFrames;
+            frames_buf[count] = try Frame.read(&stream);
+            count += 1;
+        }
+
+        return FrameSet{
+            .stream = stream,
+            .sequence_number = sequence_number,
+            .frames = frames_buf[0..count],
+            .owns_frames = false,
+        };
+    }
+
     pub fn deserialize(buffer: []const u8, allocator: std.mem.Allocator) !FrameSet {
         var stream = BinaryStream.init(allocator, buffer, null);
         errdefer stream.deinit();
@@ -113,6 +143,42 @@ test "FrameSet" {
     try std.testing.expectEqualSlices(u8, frames[0].payload, deserialized.frames[0].payload);
 
     frameset.deinit(allocator);
+}
+
+test "FrameSet deserializeInto borrows frames and input without allocating" {
+    const allocator = std.testing.allocator;
+
+    const first_payload = "first";
+    const second_payload = "second payload";
+    const frames = [_]Frame{
+        Frame.init(1, null, null, null, .Reliable, first_payload, null, null, null, null),
+        Frame.init(2, null, null, null, .Reliable, second_payload, null, null, null, null),
+    };
+
+    var buffer: [256]u8 = undefined;
+    const serialized = try FrameSet.serializeInto(77, &frames, &buffer);
+
+    var frames_scratch: [8]Frame = undefined;
+    var deserialized = try FrameSet.deserializeInto(serialized, &frames_scratch);
+    defer deserialized.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u24, 77), deserialized.sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), deserialized.frames.len);
+    try std.testing.expectEqualSlices(u8, first_payload, deserialized.frames[0].payload);
+    try std.testing.expectEqualSlices(u8, second_payload, deserialized.frames[1].payload);
+}
+
+test "FrameSet deserializeInto rejects framesets bigger than the scratch" {
+    const frames = [_]Frame{
+        Frame.init(1, null, null, null, .Reliable, "a", null, null, null, null),
+        Frame.init(2, null, null, null, .Reliable, "b", null, null, null, null),
+    };
+
+    var buffer: [256]u8 = undefined;
+    const serialized = try FrameSet.serializeInto(1, &frames, &buffer);
+
+    var frames_scratch: [1]Frame = undefined;
+    try std.testing.expectError(error.TooManyFrames, FrameSet.deserializeInto(serialized, &frames_scratch));
 }
 
 test "FrameSet serializeInto writes into the caller buffer" {

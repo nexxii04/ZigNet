@@ -4,6 +4,32 @@ pub const BinaryStream = @import("BinaryStream").BinaryStream;
 pub const Reliability = enum(u3) { Unreliable, UnreliableSequenced, Reliable, ReliableOrdered, ReliableSequenced, UnreliableWithAckReceipt, ReliableWithAckReceipt, ReliableOrderedWithAckReceipt };
 const Flags = enum(u8) { Split = 0x10, Valid = 0x80, Ack = 0x40, Nack = 0x20 };
 
+/// Reference-counted payload shared by several frames. The creator holds the
+/// initial reference; the last `release` frees the bytes and the wrapper.
+pub const SharedPayload = struct {
+    bytes: []u8,
+    refs: std.atomic.Value(u32),
+    allocator: std.mem.Allocator,
+
+    pub fn create(allocator: std.mem.Allocator, bytes: []u8) !*SharedPayload {
+        const self = try allocator.create(SharedPayload);
+        self.* = .{ .bytes = bytes, .refs = .init(1), .allocator = allocator };
+        return self;
+    }
+
+    pub fn retain(self: *SharedPayload) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *SharedPayload) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            const allocator = self.allocator;
+            allocator.free(self.bytes);
+            allocator.destroy(self);
+        }
+    }
+};
+
 pub const Frame = struct {
     reliable_frame_index: ?u32,
     sequence_frame_index: ?u32,
@@ -15,6 +41,11 @@ pub const Frame = struct {
     split_id: ?u16,
     split_size: ?u32,
     allocator: ?std.mem.Allocator,
+    /// If set, `deinit` releases this reference instead of freeing `payload`.
+    shared: ?*SharedPayload = null,
+    /// If set, the payload is these packets framed at serialization time
+    /// (`[254][0xFF]` + varint-prefixed). Slices must outlive serialization.
+    packets: ?[]const []const u8 = null,
 
     pub fn init(reliable_frame_index: ?u32, sequence_frame_index: ?u32, ordered_frame_index: ?u32, order_channel: ?u8, reliability: Reliability, payload: []const u8, split_frame_index: ?u32, split_id: ?u16, split_size: ?u32, allocator: ?std.mem.Allocator) Frame {
         return .{
@@ -31,8 +62,28 @@ pub const Frame = struct {
         };
     }
 
+    /// Payload is `packets` framed at send time, with no intermediate buffer.
+    pub fn initPacketBatch(packets: []const []const u8, reliability: Reliability, order_channel: ?u8, allocator: ?std.mem.Allocator) Frame {
+        var frame = Frame.init(null, null, null, order_channel, reliability, &.{}, null, null, null, allocator);
+        frame.packets = packets;
+        return frame;
+    }
+
     /// Safe to call twice.
     pub fn deinit(self: *Frame) void {
+        if (self.shared) |shared| {
+            shared.release();
+            self.shared = null;
+            self.payload = &.{};
+            self.allocator = null;
+            return;
+        }
+        if (self.packets != null) {
+            // Borrowed: nothing to free.
+            self.packets = null;
+            self.allocator = null;
+            return;
+        }
         if (self.allocator) |alloc| {
             if (self.payload.len > 0) {
                 alloc.free(self.payload);
@@ -96,11 +147,20 @@ pub const Frame = struct {
         return Frame.init(reliable_frame_index, sequence_frame_index, ordered_frame_index, order_channel, reliability, payload, split_frame_index, split_id, split_size, null);
     }
 
+    pub fn framedPayloadLength(self: *const Frame) usize {
+        if (self.packets) |packets| {
+            var total: usize = 2; // [254][0xFF] header
+            for (packets) |packet| total += varintSize(packet.len) + packet.len;
+            return total;
+        }
+        return self.payload.len;
+    }
+
     pub fn write(self: *const Frame, stream: *BinaryStream) !void {
         const flags: u8 = ((@as(u8, @intFromEnum(self.reliability)) << 5) & 0xe0) |
             if (self.isSplit()) @intFromEnum(Flags.Split) else 0;
         try stream.writeUint8(flags);
-        const length_in_bits = @as(u16, @intCast(self.payload.len)) * 8;
+        const length_in_bits = @as(u16, @intCast(self.framedPayloadLength())) * 8;
         try stream.writeUint16(length_in_bits, .Big);
 
         if (self.isReliable()) {
@@ -117,6 +177,15 @@ pub const Frame = struct {
             try stream.writeUint32(self.split_size.?, .Big);
             try stream.writeUint16(self.split_id.?, .Big);
             try stream.writeUint32(self.split_frame_index.?, .Big);
+        }
+        if (self.packets) |packets| {
+            try stream.writeUint8(254);
+            try stream.writeUint8(0xFF);
+            for (packets) |packet| {
+                try stream.writeVarInt(@intCast(packet.len));
+                try stream.write(packet);
+            }
+            return;
         }
         try stream.write(self.payload);
     }
@@ -155,7 +224,7 @@ pub const Frame = struct {
 
     pub fn getByteLength(self: *const Frame) usize {
         return 3 +
-            self.payload.len +
+            self.framedPayloadLength() +
             (if (self.isReliable()) @as(usize, 3) else 0) +
             (if (self.isSequenced()) @as(usize, 3) else 0) +
             (if (self.isOrdered()) @as(usize, 4) else 0) +
@@ -179,4 +248,77 @@ test "Frame deinit is idempotent" {
     frame.deinit();
     frame.deinit();
     try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}
+
+fn varintSize(value: usize) usize {
+    if (value < 0x80) return 1;
+    if (value < 0x4000) return 2;
+    if (value < 0x200000) return 3;
+    if (value < 0x10000000) return 4;
+    return 5;
+}
+
+test "a packet batch frame serializes the unframed compression framing inline" {
+    const allocator = std.testing.allocator;
+    const packets = [_][]const u8{ "hello", "", &[_]u8{0xAB} ** 200 };
+
+    var frame = Frame.initPacketBatch(&packets, .ReliableOrdered, 0, null);
+    frame.reliable_frame_index = 7;
+    frame.ordered_frame_index = 3;
+
+    var expected_payload: std.ArrayList(u8) = .empty;
+    defer expected_payload.deinit(allocator);
+    try expected_payload.append(allocator, 254);
+    try expected_payload.append(allocator, 0xFF);
+    for (packets) |packet| {
+        if (packet.len < 0x80) {
+            try expected_payload.append(allocator, @intCast(packet.len));
+        } else {
+            try expected_payload.append(allocator, @intCast((packet.len & 0x7F) | 0x80));
+            try expected_payload.append(allocator, @intCast(packet.len >> 7));
+        }
+        try expected_payload.appendSlice(allocator, packet);
+    }
+
+    try std.testing.expectEqual(expected_payload.items.len, frame.framedPayloadLength());
+
+    var buffer: [1024]u8 = undefined;
+    var stream = BinaryStream{
+        .payload = &buffer,
+        .written = 0,
+        .offset = 0,
+        .allocator = undefined,
+        .owns_buffer = false,
+    };
+    try frame.write(&stream);
+
+    var reader = BinaryStream.init(allocator, stream.getBuffer(), null);
+    const decoded = try Frame.read(&reader);
+    try std.testing.expectEqual(Reliability.ReliableOrdered, decoded.reliability);
+    try std.testing.expectEqual(@as(?u32, 7), decoded.reliable_frame_index);
+    try std.testing.expectEqual(@as(?u32, 3), decoded.ordered_frame_index);
+    try std.testing.expectEqualSlices(u8, expected_payload.items, decoded.payload);
+
+    // deinit of a borrowed batch releases nothing and is idempotent.
+    frame.deinit();
+    frame.deinit();
+}
+
+test "a shared payload outlives the frames that reference it" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, "shared across frames");
+    const shared = try SharedPayload.create(allocator, bytes);
+
+    var first = Frame.init(1, null, null, null, .Reliable, shared.bytes[0..6], null, null, null, null);
+    first.shared = shared;
+    shared.retain();
+    var second = Frame.init(2, null, null, null, .Reliable, shared.bytes[6..], null, null, null, null);
+    second.shared = shared;
+    shared.retain();
+
+    // Release the creator's reference: the two frames keep it alive.
+    shared.release();
+    first.deinit();
+    try std.testing.expectEqualSlices(u8, " across frames", second.payload);
+    second.deinit();
 }
